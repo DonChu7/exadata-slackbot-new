@@ -15,9 +15,14 @@ from typing import Any, List
 import traceback
 from urllib.parse import urlparse
 
+
 from dotenv import load_dotenv
-from slack_bolt import App
-from slack_bolt.adapter.socket_mode import SocketModeHandler
+# from slack_bolt import App
+# from slack_bolt.adapter.socket_mode import SocketModeHandler
+import asyncio
+from slack_bolt.async_app import AsyncApp
+from slack_bolt.adapter.socket_mode.aiohttp import AsyncSocketModeHandler
+from slack_sdk.web.async_client import AsyncWebClient
 
 from mcp_client import PersistentMCPClient
 
@@ -62,7 +67,7 @@ DEFAULT_GENXML = OS.getenv("GENOEDAXML_PATH",
 # ---------------------------------------------------------------------------
 # feedbacks 
 # ---------------------------------------------------------------------------
-def post_with_feedback(app, channel_id: str, thread_ts: str | None, text: str, *,
+async def post_with_feedback(app, channel_id: str, thread_ts: str | None, text: str, *,
                        context: dict | None = None) -> str:
     """
     Posts a message with thumbs up/down buttons. Returns the message_ts.
@@ -80,7 +85,7 @@ def post_with_feedback(app, channel_id: str, thread_ts: str | None, text: str, *
 
     tiny_payload = json.dumps({"uuid": uid})
 
-    res = app.client.chat_postMessage(
+    res = await app.client.chat_postMessage(
         channel=channel_id,
         thread_ts=thread_ts,
         text=text,
@@ -91,6 +96,7 @@ def post_with_feedback(app, channel_id: str, thread_ts: str | None, text: str, *
 # ---------------------------------------------------------------------------
 # Helpers (Jenkins + file transfer)
 # ---------------------------------------------------------------------------
+
 def _jenkins_session():
     if not (JENKINS_URL and JENKINS_USER and JENKINS_API_TOKEN):
         raise RuntimeError("Missing JENKINS_URL/JENKINS_USER/JENKINS_API_TOKEN")
@@ -107,7 +113,7 @@ def _jenkins_session():
         pass
     return s
 
-def trigger_upgrade_loop_run(params=None):
+async def trigger_upgrade_loop_run(params=None):
     s = _jenkins_session()
     base = f"{JENKINS_URL}/job/{JENKINS_FOLDER}/job/{JENKINS_JOB}"
     endpoint = f"{base}/buildWithParameters" if params else f"{base}/build"
@@ -210,7 +216,8 @@ def scp_file_with_key(file_path: str, destination: str, ssh_key_path: str) -> bo
 # ---------------------------------------------------------------------------
 # Slack app
 # ---------------------------------------------------------------------------
-app = App(token=SLACK_BOT_TOKEN)
+#app = App(token=SLACK_BOT_TOKEN)
+app = AsyncApp(token=SLACK_BOT_TOKEN)
 
 # MCP clients (persistent stdio)
 RUNINTEG_CLIENT = PersistentMCPClient(RUNINTEG_CMD)
@@ -247,7 +254,7 @@ class GenerateOedaArgs(BaseModel):
 
 
 @tool("generate_oedaxml", args_schema=GenerateOedaArgs)
-def generate_oedaxml_tool(request: str) -> str:
+async def generate_oedaxml_tool(request: str) -> str:
     "Generate Exadata configuration artifacts (minconfig.json and es.xml). Always pass the full user request."
     payload = {
         "request": request,
@@ -255,7 +262,7 @@ def generate_oedaxml_tool(request: str) -> str:
         "return_xml": True,
         "force_mock": True,
     }
-    res = OEDA_CLIENT.call_tool("generate_oedaxml", payload)
+    res = await asyncio.to_thread(OEDA_CLIENT.call_tool, "generate_oedaxml", payload)
     thread_id = CURRENT_THREAD_ID.get()
     if thread_id:
         TOOL_RUN_RESULTS[thread_id].append({"name": "generate_oedaxml", "result": res})
@@ -280,23 +287,23 @@ class RunintegrationStatusArgs(BaseModel):
 
 
 @tool("runintegration_status", args_schema=RunintegrationStatusArgs)
-def runintegration_status_tool(rack: str) -> str:
+async def runintegration_status_tool(rack: str) -> str:
     "Check RunIntegration status for a specific rack."
-    res = RUNINTEG_CLIENT.status(rack)
+    res = await asyncio.to_thread(RUNINTEG_CLIENT.status, rack)
     return _format_json(res)
 
 
 @tool("runintegration_idle_envs")
-def runintegration_idle_envs_tool() -> str:
+async def runintegration_idle_envs_tool() -> str:
     "List idle RunIntegration environments."
-    res = RUNINTEG_CLIENT.idle_envs()
+    res = await asyncio.to_thread(RUNINTEG_CLIENT.idle_envs())
     return _format_json(res)
 
 
 @tool("runintegration_disabled_envs")
-def runintegration_disabled_envs_tool() -> str:
+async def runintegration_disabled_envs_tool() -> str:
     "List disabled RunIntegration environments."
-    res = RUNINTEG_CLIENT.disabled_envs()
+    res = await asyncio.to_thread(RUNINTEG_CLIENT.disabled_envs())
     return _format_json(res)
 
 
@@ -306,9 +313,9 @@ class RagQueryArgs(BaseModel):
 
 
 @tool("rag_query", args_schema=RagQueryArgs)
-def rag_query_tool(question: str, k: int = 3) -> str:
+async def rag_query_tool(question: str, k: int = 3) -> str:
     "Retrieve grounded answers about Exadata and Oracle topics."
-    res = RAG_CLIENT.call_tool("rag_query", {"question": question, "k": k})
+    res = await asyncio.to_thread(RAG_CLIENT.call_tool, "rag_query", {"question": question, "k": k})
     return _format_json(res)
 
 
@@ -317,9 +324,9 @@ class SummarizeTextArgs(BaseModel):
 
 
 @tool("summarize_text", args_schema=SummarizeTextArgs)
-def summarize_text_tool(text: str) -> str:
+async def summarize_text_tool(text: str) -> str:
     "Summarize a block of text."
-    res = SUM_CLIENT.call_tool("lc_summarize_text", {"text": text})
+    res = await asyncio.to_thread(SUM_CLIENT.call_tool, "lc_summarize_text", {"text": text})
     return _format_json(res)
 
 
@@ -378,7 +385,7 @@ def _collect_tool_names(messages: List[AnyMessage]) -> List[str]:
     return names
 
 
-def _handle_tool_side_effects(thread_id: str, channel_id: str, thread_ts: str | None, slack_client) -> None:
+async def _handle_tool_side_effects(thread_id: str, channel_id: str, thread_ts: str | None, slack_client) -> None:
     runs = TOOL_RUN_RESULTS.pop(thread_id, []) if thread_id else []
     for entry in runs:
         name = entry.get("name")
@@ -392,7 +399,7 @@ def _handle_tool_side_effects(thread_id: str, channel_id: str, thread_ts: str | 
                     with TF.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
                         tmp.write(xml_bytes)
                         tmp_path = tmp.name
-                    slack_client.files_upload_v2(
+                    await slack_client.files_upload_v2(
                         channels=[channel_id],
                         thread_ts=thread_ts,
                         initial_comment="Attached is the generated `es.xml` file from `generate_oedaxml`.",
@@ -401,7 +408,7 @@ def _handle_tool_side_effects(thread_id: str, channel_id: str, thread_ts: str | 
                         title="es.xml",
                     )
                 except Exception as upload_err:
-                    slack_client.chat_postMessage(
+                    await slack_client.chat_postMessage(
                         channel=channel_id,
                         thread_ts=thread_ts,
                         text=f":warning: Failed to upload es.xml: {upload_err}",
@@ -416,7 +423,7 @@ def _handle_tool_side_effects(thread_id: str, channel_id: str, thread_ts: str | 
             if live_check == "fail":
                 reason = result.get("live_mig_reason") or "Live migration validation failed."
                 rack_desc = result.get("rack_desc") or "unknown"
-                slack_client.chat_postMessage(
+                await slack_client.chat_postMessage(
                     channel=channel_id,
                     thread_ts=thread_ts,
                     text=f":no_entry: Live migration check failed: {reason}\nRack description: `{rack_desc}`",
@@ -427,17 +434,17 @@ def _handle_tool_side_effects(thread_id: str, channel_id: str, thread_ts: str | 
 # Slack event handler
 # ---------------------------------------------------------------------------
 @app.action("fb_up")
-def handle_fb_up(ack, body, client, say):
-    ack()
+async def handle_fb_up(ack, body, client, say):
+    await ack()
     record_feedback_click(body, "up", client)
 
 @app.action("fb_down")
-def handle_fb_down(ack, body, client, say):
-    ack()
+async def handle_fb_down(ack, body, client, say):
+    await ack()
     record_feedback_click(body, "down", client)
 
 @app.event("app_mention")
-def handle_app_mention(event, say, client):
+async def handle_app_mention(event, say, client):
     user_question = event.get("text", "")
     cleaned = " ".join(tok for tok in user_question.split() if not tok.startswith("<@"))
     lower = cleaned.lower()
@@ -455,7 +462,7 @@ def handle_app_mention(event, say, client):
                 mt = f.get("mimetype", "")
                 if name.lower().endswith(".pdf") or mt in ("application/pdf", "application/octet-stream"):
                     had_pdf = True
-                    say(f":page_facing_up: Got `{name}` — summarizing…", thread_ts=thread_ts)
+                    await say(f":page_facing_up: Got `{name}` — summarizing…", thread_ts=thread_ts)
                     headers = {"Authorization": f"Bearer {OS.getenv('SLACK_BOT_TOKEN', '')}"}
                     r = requests.get(f["url_private_download"], headers=headers, timeout=60)
                     r.raise_for_status()
@@ -472,51 +479,51 @@ def handle_app_mention(event, say, client):
                         pass
 
                     if res.get("error"):
-                        say(f":x: Summarizer error: {res['error']}", thread_ts=thread_ts)
+                        await say(f":x: Summarizer error: {res['error']}", thread_ts=thread_ts)
                     else:
                         pages = res.get("pages") or res.get("num_pages")
                         notes = res.get("notes", "") or res.get("chain_type", "")
                         summary = res.get("summary")
                         if not summary:
-                            say(":warning: Summarizer returned no summary.", thread_ts=thread_ts)
+                            await say(":warning: Summarizer returned no summary.", thread_ts=thread_ts)
                         else:
-                            say(f"*Summary for* `{name}` ({pages if pages is not None else '?'} pages):\n{summary}", thread_ts=thread_ts)
+                            await say(f"*Summary for* `{name}` ({pages if pages is not None else '?'} pages):\n{summary}", thread_ts=thread_ts)
                             if notes:
-                                say(f"_Note_: {notes}", thread_ts=thread_ts)
+                                await say(f"_Note_: {notes}", thread_ts=thread_ts)
             if had_pdf:
                 return
         except Exception as e:
-            say(f":x: MCP error (summarizer): {e}", thread_ts=thread_ts)
+            await say(f":x: MCP error (summarizer): {e}", thread_ts=thread_ts)
             return
 
     if ("jenkins" in lower and ("upgrade loop run" in lower or "upgrade_loop_run" in lower) and
         any(x in lower for x in ["submit", "build", "kick", "start"])):
         try:
             params = _parse_env_params_from_text(lower)
-            say(text="Got it ✅ submitting Jenkins build: UPGRADE_LOOP_RUN / 01_PRE_SETUP_FOR_SM", thread_ts=thread_ts)
-            result = trigger_upgrade_loop_run(params=params)
+            await say(text="Got it ✅ submitting Jenkins build: UPGRADE_LOOP_RUN / 01_PRE_SETUP_FOR_SM", thread_ts=thread_ts)
+            result = await trigger_upgrade_loop_run(params=params)
             msg = "\n".join(filter(None, [
                 f"Params: {params}" if params else "",
                 f"Queue: {result.get('queue_url')}",
                 f"Job: {result.get('job_url')}",
             ]))
-            say(text=msg, thread_ts=thread_ts)
+            await say(text=msg, thread_ts=thread_ts)
             threading.Thread(
                 target=_monitor_and_notify,
                 args=(result.get("queue_url"), result.get("job_url"), channel_id, thread_ts),
                 daemon=True
             ).start()
         except Exception as e:
-            say(text=f"Trigger failed: `{e}`", thread_ts=thread_ts)
+            await say(text=f"Trigger failed: `{e}`", thread_ts=thread_ts)
         return
 
     if any(w in lower for w in ["send", "transfer", "upload"]) and any(w in lower for w in ["file", "attachment"]):
         match = re.search(r'\b[\w.-]+@[\d.]+:[\w/\-_.]+\b', user_question)
         if not event.get("files"):
-            say("⚠️ You asked me to send a file, but no attachment was found.", thread_ts=thread_ts)
+            await say("⚠️ You asked me to send a file, but no attachment was found.", thread_ts=thread_ts)
             return
         if not match:
-            say("❌ Please include a destination like `user@host:/path`.", thread_ts=thread_ts)
+            await say("❌ Please include a destination like `user@host:/path`.", thread_ts=thread_ts)
             return
         dest = match.group()
         try:
@@ -530,12 +537,12 @@ def handle_app_mention(event, say, client):
                     tmp.write(r.content)
                     tmp_path = tmp.name
                 if scp_file_with_key(tmp_path, dest, ssh_key_path="/net/10.32.19.91/export/exadata_images/ImageTests/.pxeqa_connect"):
-                    say(f"✅ Sent `{name}` to `{dest}`", thread_ts=thread_ts)
+                    await say(f"✅ Sent `{name}` to `{dest}`", thread_ts=thread_ts)
                 else:
-                    say(f"❌ Failed to send `{name}` to `{dest}`", thread_ts=thread_ts)
+                    await say(f"❌ Failed to send `{name}` to `{dest}`", thread_ts=thread_ts)
                 OS.unlink(tmp_path)
         except Exception as e:
-            say(f"⚠️ Error sending file: {e}", thread_ts=thread_ts)
+            await say(f"⚠️ Error sending file: {e}", thread_ts=thread_ts)
         return
 
     config = {"configurable": {"thread_id": thread_key}}
@@ -543,17 +550,17 @@ def handle_app_mention(event, say, client):
     agent_messages = prior_messages + [{"role": "user", "content": cleaned}]
     token = CURRENT_THREAD_ID.set(thread_key)
     try:
-        result = AGENT.invoke({"messages": agent_messages}, config=config)
+        result = await AGENT.ainvoke({"messages": agent_messages}, config=config)
     except Exception as agent_err:
         print(f"[AGENT ERROR] {agent_err}")
         traceback.print_exc()
-        say(":x: I hit an error while routing that request—trying a direct search fallback.", thread_ts=thread_ts)
+        await say(":x: I hit an error while routing that request—trying a direct search fallback.", thread_ts=thread_ts)
         try:
             fallback = RAG_CLIENT.call_tool("rag_query", {"question": cleaned, "k": 3})
             _append_history(thread_key, "user", cleaned)
             if fallback.get("error"):
                 err_msg = f":warning: RAG fallback errored: {fallback['error']}"
-                say(err_msg, thread_ts=thread_ts)
+                await say(err_msg, thread_ts=thread_ts)
                 _append_history(thread_key, "assistant", err_msg)
             else:
                 ans = fallback.get("answer", "[no answer]")
@@ -562,11 +569,11 @@ def handle_app_mention(event, say, client):
                     f"• {s.get('title', 'untitled')} ({s.get('source') or 'n/a'})" for s in srcs
                 )
                 fallback_text = f"{ans}\n\n*Sources:*\n{src_lines or '—'}"
-                say(fallback_text, thread_ts=thread_ts)
+                await say(fallback_text, thread_ts=thread_ts)
                 _append_history(thread_key, "assistant", fallback_text)
         except Exception as fallback_err:
             err_msg = f":x: MCP error (RAG fallback): {fallback_err}"
-            say(err_msg, thread_ts=thread_ts)
+            await say(err_msg, thread_ts=thread_ts)
             _append_history(thread_key, "assistant", err_msg)
         return
     finally:
@@ -595,25 +602,31 @@ def handle_app_mention(event, say, client):
 
     if final_text.strip():
         try:
-            post_with_feedback(app, channel_id, thread_ts, final_text.strip(), context=feedback_context)
+            await post_with_feedback(app, channel_id, thread_ts, final_text.strip(), context=feedback_context)
         except Exception:
-            say(final_text.strip(), thread_ts=thread_ts)
+            await say(final_text.strip(), thread_ts=thread_ts)
     else:
-        say(":grey_question: I couldn't produce a response for that.", thread_ts=thread_ts)
+        await say(":grey_question: I couldn't produce a response for that.", thread_ts=thread_ts)
 
-    _handle_tool_side_effects(thread_key, channel_id, thread_ts, client)
+    await _handle_tool_side_effects(thread_key, channel_id, thread_ts, client)
 
 
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
+async def _run():
+    print("[BOOT] Starting Slack bot...")
+    print("  LLM_PROVIDER:", OS.getenv("LLM_PROVIDER"))
+    print("  RAG_CMD:", OS.getenv("RAG_CMD"))
+    handler = AsyncSocketModeHandler(app, SLACK_APP_TOKEN)
+    await handler.start_async()
+
 if __name__ == "__main__":
     print("[BOOT] Starting Slack bot...")
     print("  LLM_PROVIDER:", OS.getenv("LLM_PROVIDER"))
     print("  RAG_CMD:", OS.getenv("RAG_CMD"))
     try:
-        handler = SocketModeHandler(app, SLACK_APP_TOKEN)
-        handler.start()
+        asyncio.run(_run())
     finally:
         # graceful MCP shutdown
         for cli in (RUNINTEG_CLIENT, OEDA_CLIENT, RAG_CLIENT, SUM_CLIENT):
