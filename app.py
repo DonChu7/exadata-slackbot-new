@@ -31,7 +31,7 @@ from metrics_utils import feedback_blocks, record_feedback_click, append_jsonl, 
 
 from pydantic import BaseModel, Field
 from langchain_core.tools import tool
-from langchain_core.messages import ToolMessage, AIMessage, AnyMessage
+from langchain_core.messages import ToolMessage, AIMessage, AnyMessage, HumanMessage
 from langgraph.prebuilt import create_react_agent
 from langgraph.prebuilt.chat_agent_executor import AgentState
 
@@ -58,6 +58,7 @@ RUNINTEG_CMD = OS.getenv("RUNINTEG_CMD", "python /scratch/dongyzhu/exadata-slack
 OEDA_CMD     = OS.getenv("OEDA_CMD",     "python /scratch/dongyzhu/exadata-slackbot/oeda_server.py").split()
 RAG_CMD      = OS.getenv("RAG_CMD",      "python /scratch/dongyzhu/exadata-slackbot/exa23ai_rag_server.py").split()
 SUM_CMD      = OS.getenv("SUM_CMD",      "python /scratch/dongyzhu/exadata-slackbot/summarizer_server.py").split()
+GENAI4TEST_CMD = OS.getenv("GENAI4TEST_CMD","python /scratch/dongyzhu/exadata-slackbot/genai4test_server.py").split()
 
 # Default genoedaxml path (allowlisted in oeda_server)
 DEFAULT_GENXML = OS.getenv("GENOEDAXML_PATH",
@@ -213,6 +214,67 @@ def scp_file_with_key(file_path: str, destination: str, ssh_key_path: str) -> bo
         print("[ERROR] SCP failed:", e.stderr.decode())
         return False
 
+def _pick_genai4test_filename(res: dict) -> str:
+    """
+    Derive a reasonable filename from genai4test result.
+    Prefer URL basename; otherwise infer from script; default to .txt.
+    """
+    # Prefer URL basename if available
+    url = (res.get("absolute_file_url") or res.get("file_url") or "").strip()
+    if url:
+        name = OS.path.basename(urlparse(url).path)
+        if name:
+            return name
+
+    # Infer from inline script (sql/sh) if present
+    script = (res.get("sql") or "").lstrip()
+    if script.startswith("#"):  # looks like shell
+        return "genai4test_script.sh"
+    # crude SQL heuristic
+    if script.startswith("Rem"):
+        return "genai4test_script.sql"
+    return "genai4test_output.txt"
+
+def _download_bytes(url: str, verify) -> bytes:
+    s = requests.Session()
+    s.trust_env = False
+    s.proxies = {"http": None, "https": None}
+    r = s.get(url, timeout=(10, 600), verify=verify)
+    r.raise_for_status()
+    return r.content
+
+async def _get_first_name(client, user_id: str) -> str:
+    """
+    Try multiple profile fields (first_name/given_name/display/real_name),
+    fall back to the local-part of email, then to 'there'.
+    """
+    try:
+        ui = await client.users_info(user=user_id)   # requires 'users:read' scope
+        user = (ui or {}).get("user", {}) or {}
+        prof = user.get("profile", {}) or {}
+
+        candidates = [
+            prof.get("first_name"),                 # legacy; often empty
+            prof.get("given_name"),                 # some workspaces use this
+            prof.get("display_name_normalized"),
+            prof.get("display_name"),
+            prof.get("real_name_normalized"),
+            prof.get("real_name"),
+            user.get("name"),                       # legacy handle
+        ]
+        first = next((c for c in candidates if c), None)
+        if first and " " in first:
+            first = first.split()[0]
+
+        if not first:
+            email = prof.get("email")
+            if email and "@" in email:
+                first = email.split("@", 1)[0]
+
+        return first or "there"
+    except Exception as e:
+        print("[users_info] error:", type(e).__name__, e)
+        return "there"
 # ---------------------------------------------------------------------------
 # Slack app
 # ---------------------------------------------------------------------------
@@ -224,16 +286,13 @@ RUNINTEG_CLIENT = PersistentMCPClient(RUNINTEG_CMD)
 OEDA_CLIENT     = PersistentMCPClient(OEDA_CMD)
 RAG_CLIENT      = PersistentMCPClient(RAG_CMD)
 SUM_CLIENT      = PersistentMCPClient(SUM_CMD)
+GENAI4TEST_CLIENT = PersistentMCPClient(GENAI4TEST_CMD)
 
 # LangGraph agent setup
 CURRENT_THREAD_ID = contextvars.ContextVar("current_thread_id", default=None)
 TOOL_RUN_RESULTS: defaultdict[str, List[dict[str, Any]]] = defaultdict(list)
 
-
-
 THREAD_HISTORY: defaultdict[str, list[dict[str, str]]] = defaultdict(list)
-
-
 def _append_history(thread_id: str, role: str, content: str | None):
     if not thread_id or not content:
         return
@@ -247,6 +306,26 @@ def _format_json(data: Any) -> str:
         return json.dumps(data, indent=2, default=str)
     except Exception:
         return str(data)
+
+# Maps thread_id -> list of artifacts (most recent last)
+THREAD_ARTIFACTS: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+def _record_artifact(thread_id: str, filename: str, local_path: str, source: str):
+    """
+    Remember a local file created/obtained in this thread for later reuse.
+    We keep paths to temp files; do not unlink them until done uploading.
+    """
+    if not (thread_id and local_path and OS.path.exists(local_path)):
+        return
+    THREAD_ARTIFACTS[thread_id].append({
+        "filename": filename,
+        "local_path": local_path,
+        "source": source,
+        "ts": time.time(),
+    })
+
+def _latest_artifact(thread_id: str) -> dict | None:
+    items = THREAD_ARTIFACTS.get(thread_id) or []
+    return items[-1] if items else None
 
 
 class GenerateOedaArgs(BaseModel):
@@ -296,16 +375,53 @@ async def runintegration_status_tool(rack: str) -> str:
 @tool("runintegration_idle_envs")
 async def runintegration_idle_envs_tool() -> str:
     "List idle RunIntegration environments."
-    res = await asyncio.to_thread(RUNINTEG_CLIENT.idle_envs())
+    res = await asyncio.to_thread(RUNINTEG_CLIENT.idle_envs)
     return _format_json(res)
 
 
 @tool("runintegration_disabled_envs")
 async def runintegration_disabled_envs_tool() -> str:
     "List disabled RunIntegration environments."
-    res = await asyncio.to_thread(RUNINTEG_CLIENT.disabled_envs())
+    res = await asyncio.to_thread(RUNINTEG_CLIENT.disabled_envs)
     return _format_json(res)
 
+
+
+class BugTestArgs(BaseModel):
+    bug_no: str = Field(..., description="Bug number, e.g. 35123456")
+    email: str | None = Field(None, description="Email to use (optional)")
+    agent: str | None = Field(None, description="genai4test agent (optional)")
+
+@tool("run_bug_test", args_schema=BugTestArgs)
+async def run_bug_test_tool(bug_no: str, email: str | None = None, agent: str | None = None) -> str:
+    """
+    Generate a shell test for a bug via genai4test.
+    Returns a summary with script/code and optional file URL.
+    """
+    args = {"bug_no": bug_no}
+    if email: args["email"] = email
+    if agent: args["agent"] = agent
+
+    # offload MCP call to a thread (PersistentMCPClient is sync)
+    res = await asyncio.to_thread(GENAI4TEST_CLIENT.call_tool, "run_bug_test", args)
+
+    # keep for later slack rendering / debugging
+    thread_id = CURRENT_THREAD_ID.get()
+    if thread_id:
+        TOOL_RUN_RESULTS[thread_id].append({"name": "run_bug_test", "result": res})
+
+    # If failed, surface the error details directly so Slack shows them
+    if not isinstance(res, dict) or not res.get("ok"):
+        err = (isinstance(res, dict) and (res.get("error") or res.get("status"))) or "unknown error"
+        body = isinstance(res, dict) and res.get("body")
+        details = f":x: genai4test failed for bug {bug_no}: {err}"
+        if body:
+            details += "\n```" + str(body)[:500] + "```"
+        # still return text so the agent can show it verbatim
+        return details
+
+    # success path: return compact JSON the agent can read
+    return _format_json(res) if isinstance(res, dict) else str(res)
 
 class RagQueryArgs(BaseModel):
     question: str = Field(..., description="Question to answer using the Exadata knowledge base.")
@@ -352,6 +468,7 @@ AGENT_TOOLS = [
     runintegration_disabled_envs_tool,
     summarize_text_tool,
     rag_query_tool,
+    run_bug_test_tool, 
 ]
 AGENT = create_react_agent(
     model=LLM,
@@ -407,18 +524,13 @@ async def _handle_tool_side_effects(thread_id: str, channel_id: str, thread_ts: 
                         filename="es.xml",
                         title="es.xml",
                     )
+                    _record_artifact(thread_ts or str(thread_id), "es.xml", tmp_path, source="oeda")
                 except Exception as upload_err:
                     await slack_client.chat_postMessage(
                         channel=channel_id,
                         thread_ts=thread_ts,
                         text=f":warning: Failed to upload es.xml: {upload_err}",
                     )
-                finally:
-                    if tmp_path and OS.path.exists(tmp_path):
-                        try:
-                            OS.unlink(tmp_path)
-                        except Exception:
-                            pass
             live_check = result.get("live_mig_check")
             if live_check == "fail":
                 reason = result.get("live_mig_reason") or "Live migration validation failed."
@@ -452,6 +564,14 @@ async def handle_app_mention(event, say, client):
     base_ts = event.get("ts") or str(uuid.uuid4())
     thread_ts = event.get("thread_ts") or base_ts
     thread_key = thread_ts or base_ts
+    pending_uploads: list[dict[str, str]] = []   # [{"path": "...", "filename": "...", "comment": "..."}]
+    
+    # Immediate feedback message
+    user_id = event.get("user")  # Slack user ID 
+    first_name = await _get_first_name(client, user_id)
+    await say(f"Hi {first_name}, I received your request.\nPlease wait while I generate a response… :hourglass_flowing_sand:",
+          thread_ts=thread_ts)
+ 
 
     if "summarize" in lower:
         try:
@@ -517,30 +637,55 @@ async def handle_app_mention(event, say, client):
             await say(text=f"Trigger failed: `{e}`", thread_ts=thread_ts)
         return
 
-    if any(w in lower for w in ["send", "transfer", "upload"]) and any(w in lower for w in ["file", "attachment"]):
+    if any(w in lower for w in ["send", "transfer", "upload"]) and any(w in lower for w in ["file", "attachment", "generated", "test"]):
+        # parse destination
         match = re.search(r'\b[\w.-]+@[\d.]+:[\w/\-_.]+\b', user_question)
-        if not event.get("files"):
-            await say("⚠️ You asked me to send a file, but no attachment was found.", thread_ts=thread_ts)
-            return
         if not match:
             await say("❌ Please include a destination like `user@host:/path`.", thread_ts=thread_ts)
             return
         dest = match.group()
+
+        # 1) Prefer explicit attachments (if user provided)
+        files = event.get("files") or []
+        if files:
+            try:
+                for f in files:
+                    name = f["name"]
+                    url = f["url_private_download"]
+                    headers = {"Authorization": f"Bearer {OS.getenv('SLACK_BOT_TOKEN', '')}"}
+                    # download in a thread
+                    def _dl(u,h):
+                        r = requests.get(u, headers=h, timeout=60)
+                        r.raise_for_status()
+                        return r.content
+                    content = await asyncio.to_thread(_dl, url, headers)
+                    with TF.NamedTemporaryFile(delete=False, suffix=f"_{name}") as tmp:
+                        tmp.write(content)
+                        tmp_path = tmp.name
+                    ok = scp_file_with_key(tmp_path, dest, ssh_key_path="/net/10.32.19.91/export/exadata_images/ImageTests/.pxeqa_connect")
+                    if ok:
+                        await say(f"✅ Sent `{name}` to `{dest}`", thread_ts=thread_ts)
+                    else:
+                        await say(f"❌ Failed to send `{name}` to `{dest}`", thread_ts=thread_ts)
+                    # keep? usually safe to unlink explicit uploads
+                    try: OS.unlink(tmp_path)
+                    except Exception: pass
+            except Exception as e:
+                await say(f"⚠️ Error sending file: {e}", thread_ts=thread_ts)
+            return
+
+        # 2) No attachments — reuse the latest artifact generated in this thread
+        art = _latest_artifact(thread_ts or str(thread_key))
+        if not art or not OS.path.exists(art["local_path"]):
+            await say("⚠️ I couldn’t find a recent generated file in this thread. Please attach the file or re-run generation.", thread_ts=thread_ts)
+            return
+
         try:
-            for f in event["files"]:
-                name = f["name"]
-                url = f["url_private_download"]
-                headers = {"Authorization": f"Bearer {OS.getenv('SLACK_BOT_TOKEN', '')}"}
-                r = requests.get(url, headers=headers)
-                r.raise_for_status()
-                with TF.NamedTemporaryFile(delete=False, suffix=f"_{name}") as tmp:
-                    tmp.write(r.content)
-                    tmp_path = tmp.name
-                if scp_file_with_key(tmp_path, dest, ssh_key_path="/net/10.32.19.91/export/exadata_images/ImageTests/.pxeqa_connect"):
-                    await say(f"✅ Sent `{name}` to `{dest}`", thread_ts=thread_ts)
-                else:
-                    await say(f"❌ Failed to send `{name}` to `{dest}`", thread_ts=thread_ts)
-                OS.unlink(tmp_path)
+            ok = scp_file_with_key(art["local_path"], dest, ssh_key_path="/net/10.32.19.91/export/exadata_images/ImageTests/.pxeqa_connect")
+            if ok:
+                await say(f"✅ Sent `{art['filename']}` to `{dest}`", thread_ts=thread_ts)
+            else:
+                await say(f"❌ Failed to send `{art['filename']}` to `{dest}`", thread_ts=thread_ts)
         except Exception as e:
             await say(f"⚠️ Error sending file: {e}", thread_ts=thread_ts)
         return
@@ -556,7 +701,7 @@ async def handle_app_mention(event, say, client):
         traceback.print_exc()
         await say(":x: I hit an error while routing that request—trying a direct search fallback.", thread_ts=thread_ts)
         try:
-            fallback = RAG_CLIENT.call_tool("rag_query", {"question": cleaned, "k": 3})
+            fallback = await asyncio.to_thread(RAG_CLIENT.call_tool, "rag_query", {"question": cleaned, "k": 3})
             _append_history(thread_key, "user", cleaned)
             if fallback.get("error"):
                 err_msg = f":warning: RAG fallback errored: {fallback['error']}"
@@ -594,6 +739,83 @@ async def handle_app_mention(event, say, client):
     if final_text.strip():
         _append_history(thread_key, "assistant", final_text.strip())
 
+    # --- genai4test enrichment: try to attach the generated test file, or at least show a link ---
+    if "run_bug_test" in tool_names:
+        try:
+            # get the most recent run_bug_test result for this thread
+            recent = None
+            for e in reversed(TOOL_RUN_RESULTS.get(thread_key, [])):
+                if e.get("name") == "run_bug_test":
+                    recent = e.get("result") or {}
+                    break
+
+            if isinstance(recent, dict):
+                uploaded = False
+                # 1) Try remote file_url first
+                url = (recent.get("absolute_file_url") or recent.get("file_url") or "").strip()
+                if url:
+                    # use same TLS behavior as your server env to avoid warnings/failures
+                    verify_env = OS.getenv("GENAI4TEST_CA_BUNDLE") or (OS.getenv("GENAI4TEST_VERIFY_SSL","false").lower() == "true")
+                    try:
+                        content = await asyncio.to_thread(_download_bytes, url, verify_env)
+                        fname = _pick_genai4test_filename(recent)
+                        # write bytes to temp file and upload
+                        with TF.NamedTemporaryFile(delete=False, suffix=OS.path.splitext(fname)[1] or ".txt") as tmp:
+                            tmp.write(content)
+                            tmp_path = tmp.name
+                        # await client.files_upload_v2(
+                        #     channels=[channel_id],
+                        #     thread_ts=thread_ts,
+                        #     initial_comment="Attached generated test file:",
+                        #     file=tmp_path,
+                        #     filename=fname,
+                        #     title=fname,
+                        # )
+                        pending_uploads.append({
+                            "path": tmp_path,
+                            "filename": fname,
+                            "comment": "Attached generated test file:",
+                        })
+
+                        _record_artifact(thread_ts or str(thread_key), fname, tmp_path, source="genai4test")
+                        uploaded = True
+                    except Exception as upload_err:
+                        print("[genai4test] file_url upload failed:", upload_err)
+
+                # 2) If no file URL or upload failed, try inline script
+                if not uploaded:
+                    script = (recent.get("sql") or "").strip()
+                    if script:
+                        fname = _pick_genai4test_filename(recent)
+                        # if script looks like shell, ensure a .sh suffix
+                        suffix = ".sh" if fname.endswith(".sh") or script.startswith("#!") else OS.path.splitext(fname)[1] or ".sql"
+                        with TF.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                            # write as bytes to preserve encoding
+                            tmp.write(script.encode("utf-8", errors="replace"))
+                            tmp_path = tmp.name
+                        await client.files_upload_v2(
+                            channels=[channel_id],
+                            thread_ts=thread_ts,
+                            initial_comment="Attached generated test file (inline):",
+                            file=tmp_path,
+                            filename=fname,
+                            title=fname,
+                        )
+                        try:
+                            OS.unlink(tmp_path)
+                        except Exception:
+                            pass
+                        uploaded = True
+
+                # 3) If still nothing uploaded, append a download link to the message
+                if not uploaded and url:
+                    link_line = f"Download: <{url}|generated file>"
+                    final_text = (final_text + ("\n\n" if final_text else "") + link_line).strip()
+
+        except Exception as e:
+            print("[genai4test] enrichment error:", e)
+    # --- end enrichment ---
+
     feedback_context = {
         "feature": "langgraph_agent",
         "tools": tool_names,
@@ -608,6 +830,24 @@ async def handle_app_mention(event, say, client):
     else:
         await say(":grey_question: I couldn't produce a response for that.", thread_ts=thread_ts)
 
+    # --- DO THE UPLOADS *AFTER* POSTING THE SUMMARY ---
+    if pending_uploads:
+        for item in pending_uploads:
+            try:
+                await client.files_upload_v2(
+                    channels=[channel_id],
+                    thread_ts=thread_ts,                  # keep in the same thread
+                    initial_comment=item.get("comment") or "Attachment:",
+                    file=item["path"],
+                    filename=item["filename"],
+                    title=item["filename"],
+                )
+            finally:
+                # clean up temp file
+                try:
+                    OS.unlink(item["path"])
+                except Exception:
+                    pass
     await _handle_tool_side_effects(thread_key, channel_id, thread_ts, client)
 
 
@@ -622,9 +862,6 @@ async def _run():
     await handler.start_async()
 
 if __name__ == "__main__":
-    print("[BOOT] Starting Slack bot...")
-    print("  LLM_PROVIDER:", OS.getenv("LLM_PROVIDER"))
-    print("  RAG_CMD:", OS.getenv("RAG_CMD"))
     try:
         asyncio.run(_run())
     finally:
