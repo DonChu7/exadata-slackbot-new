@@ -65,7 +65,7 @@ def format_structured_output(data_type, items, summary=None):
 
     return "\n".join(lines)
 
-
+# GET TOOLS
 @app.tool()
 def get_labels_from_series(series: str, n: int = 10) -> dict:
     """
@@ -1307,7 +1307,7 @@ def find_tests_with_setup_and_flag(setup: str, flag: str) -> dict:
 
 @app.tool()
 def get_lrg_history(
-    lrg: str, series: Optional[str] = None, n: int = 20
+    lrg: str, series: Optional[str] = None, n: int = 10
 ) -> dict:
     """
     Get LRG history for a given LRG, optionally filtered by series and number of labels.
@@ -1327,7 +1327,7 @@ def get_lrg_history(
         ],
         "lrg": "lrgsample",
         "series": "OSS_MAIN",
-        "count": 20
+        "count": 10
     } or {"error": "error message"}
     """
     # Make API request
@@ -1464,6 +1464,553 @@ def get_delta_diffs_between_labels(
     }
 
 
+@app.tool()
+def lrg_point_of_contact(lrg: str) -> dict:
+    """
+    Get the owner and backup owner for an LRG.
+
+    Parameters:
+    - lrg (str): The LRG identifier
+
+    Returns:
+    dict: {
+        "lrg": "lrgsample",
+        "owner": "user@example.com",
+        "backup_owner": "backup@example.com"
+    } or {"error": "error message"}
+    """
+    # Call the utility for the LRG
+    command = ["/home/kbaboota/scripts/label_health_copilot/utils/owners", lrg]
+
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            # Parse the output
+            output_lines = result.stdout.strip().split('\n')
+            owner = None
+            backup_owner = None
+            for line in output_lines:
+                if line.startswith("LRG Owner:"):
+                    owner = line.split(":", 1)[1].strip()
+                elif line.startswith("LRG Backup Owner:"):
+                    backup_owner = line.split(":", 1)[1].strip()
+            return {
+                "lrg": lrg,
+                "owner": owner,
+                "backup_owner": backup_owner,
+            }
+        else:
+            return {"error": f"Error getting LRG owner: {result.stderr.strip()}"}
+    except subprocess.TimeoutExpired:
+        return {"error": f"LRG owners utility timed out for {lrg}"}
+    except Exception as e:
+        return {"error": f"Exception getting LRG owner: {str(e)}"}
+
+
+@app.tool()
+def get_incomplete_lrgs(label: str) -> dict:
+    """
+    Get the incomplete LRGs for a given label (LRGs still running).
+
+    Parameters:
+    - label (str): The label name (e.g., 'OSS_MAIN_LINUX.X64_250929')
+
+    Returns:
+    dict: {
+        "incomplete_lrgs": ["lrg1", "lrg2", ...],
+        "label": "OSS_MAIN_LINUX.X64_250929",
+        "count": 5
+    } or {"error": "error message"}
+    """
+    # Validate that the label exists
+    validate_url = (
+        f"https://apex.oraclecorp.com/pls/apex/lrg_times/sucs_difs/{label}"
+    )
+    validate_data, validate_error = make_api_request(validate_url)
+    if validate_error:
+        return {"error": f"Error validating label `{label}`: {validate_error}"}
+
+    # Check if label exists (count should be > 0)
+    if validate_data.get("count", 0) == 0:
+        return {
+            "error": f"Label `{label}` is invalid, not loaded, or deleted from the dataset."
+        }
+
+    # Make API request
+    url = "https://apex.oraclecorp.com/pls/apex/lrg_times/sucs_difs/incomplete_lrgs"
+    params = {"label": label}
+    data, error = make_api_request(url, params)
+    if error:
+        return {"error": f"Error fetching incomplete LRGs for `{label}`: {error}"}
+
+    items = data.get("items") or []
+    lrg_list = []
+    for item in items:
+        lrg = item.get("lrg")
+        if lrg:
+            lrg_list.append(lrg)
+
+    if not lrg_list:
+        return {
+            "incomplete_lrgs": [],
+            "label": label,
+            "message": f"No incomplete LRGs found for `{label}`",
+        }
+
+    return {
+        "incomplete_lrgs": lrg_list,
+        "label": label,
+        "count": len(lrg_list),
+    }
+
+
+@app.tool()
+def draft_email_for_lrg(label: str, lrg: str) -> dict:
+    """
+    Draft an email to the LRG owner about diffs in their LRG for a specific label.
+
+    Parameters:
+    - label (str): The label name (e.g., 'OSS_MAIN_LINUX.X64_250929')
+    - lrg (str): The LRG identifier
+
+    Returns:
+    dict: {
+        "email_draft": {
+            "recipient": "owner@example.com",
+            "subject": "Action Required: LRG lrg1 has 5 diffs in label OSS_MAIN...",
+            "body": "Dear LRG Owner,\n\nThis is an automated notification..."
+        },
+        "label": "OSS_MAIN_LINUX.X64_250929",
+        "lrg": "lrgsample"
+    } or {"error": "error message"}
+    """
+    # Validate that the label exists
+    validate_url = (
+        f"https://apex.oraclecorp.com/pls/apex/lrg_times/sucs_difs/{label}"
+    )
+    validate_data, validate_error = make_api_request(validate_url)
+    if validate_error:
+        return {"error": f"Error validating label `{label}`: {validate_error}"}
+
+    # Check if label exists (count should be > 0)
+    if validate_data.get("count", 0) == 0:
+        return {
+            "error": f"Label `{label}` is invalid, not loaded, or deleted from the dataset."
+        }
+
+    # Step 1: Get the email of the LRG owner
+    try:
+        command = ["/home/kbaboota/scripts/label_health_copilot/utils/owners", lrg]
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return {"error": f"Error getting LRG owner: {result.stderr.strip()}"}
+
+        # Parse the owner from the output
+        output_lines = result.stdout.strip().split('\n')
+        owner = None
+        for line in output_lines:
+            if line.startswith("LRG Owner:"):
+                owner = line.split(":", 1)[1].strip()
+                break
+
+        if not owner:
+            return {"error": "Could not extract owner from LRG owners utility output"}
+
+        # Convert owner (guid) to email
+        email_cmd = [
+            "/home/kbaboota/scripts/label_health_copilot/utils/guid_to_email",
+            owner,
+        ]
+        email_result = subprocess.run(
+            email_cmd, capture_output=True, text=True, check=True
+        )
+        owner_email = email_result.stdout.strip()
+        if not owner_email:
+            return {"error": f"Error: Could not convert owner GUID '{owner}' to email."}
+
+    except subprocess.CalledProcessError as e:
+        return {"error": f"Error converting owner GUID to email: {e.stderr}"}
+    except Exception as e:
+        return {"error": f"Error getting LRG owner: {str(e)}"}
+
+    # Step 2: Get the diffs in the LRG for the label
+    url = f"https://apex.oraclecorp.com/pls/apex/lrg_times/sucs_difs/diff_details/{label}"
+    params = {"lrg_filter": lrg}
+    data, error = make_api_request(url, params)
+    if error:
+        return {"error": f"Error fetching LRG diffs: {error}"}
+
+    items = data.get("items") or []
+    lrg_diffs = items
+
+    if not lrg_diffs:
+        return {
+            "email_draft": {
+                "recipient": owner_email,
+                "subject": f"No diffs found for LRG {lrg} in label {label}",
+                "body": f"No diffs found for LRG '{lrg}' in label '{label}'"
+            },
+            "label": label,
+            "lrg": lrg,
+            "message": "No diffs found"
+        }
+
+    # Step 3: Draft the email
+    subject = f"Action Required: LRG {lrg} has {len(lrg_diffs)} diffs in label {label}"
+
+    body = f"""Dear LRG Owner,
+
+This is an automated notification regarding your LRG: {lrg}
+
+Label: {label}
+Total diffs found: {len(lrg_diffs)}
+
+Diff Details:
+"""
+
+    for i, diff in enumerate(lrg_diffs, 1):
+        name = diff.get("name", "N/A")
+        status = diff.get("text", "N/A")
+        rti = diff.get("rti_number", "N/A")
+        body += f"{i}. Name: {name}\n   Status: {status}\n   RTI: {rti}\n\n"
+
+    body += """Please review and take appropriate action on these diffs.
+
+Best regards,
+Exatest Assistant"""
+
+    return {
+        "email_draft": {
+            "recipient": owner_email,
+            "subject": subject,
+            "body": body
+        },
+        "label": label,
+        "lrg": lrg,
+    }
+
+
+# POST TOOLS
+@app.tool()
+def add_series_to_auto_populate(series: str, guid: str) -> dict:
+    """
+    Add a series to auto populate with the given guid.
+
+    Parameters:
+    - series (str): The series name (e.g., 'OSS_MAIN') or comma-separated list
+    - guid (str): User GUID
+
+    Returns:
+    dict: {
+        "results": [
+            {"series": "OSS_MAIN", "status": "Success", "message": "..."} or
+            {"series": "OSS_MAIN", "status": "Error", "message": "..."}
+        ],
+        "guid": "user123"
+    }
+    """
+    try:
+        # Convert guid to email
+        email_cmd = [
+            "/home/kbaboota/scripts/label_health_copilot/utils/guid_to_email",
+            guid,
+        ]
+        email_result = subprocess.run(
+            email_cmd, capture_output=True, text=True, check=True
+        )
+        email = email_result.stdout.strip()
+        if not email:
+            return {"error": f"Could not convert guid '{guid}' to email."}
+    except subprocess.CalledProcessError as e:
+        return {"error": f"Error converting guid to email: {e.stderr}"}
+    except Exception as e:
+        return {"error": f"Error converting guid to email: {str(e)}"}
+
+    # Handle single series or list
+    if "," in series:
+        series_list = [s.strip() for s in series.split(",") if s.strip()]
+    else:
+        series_list = [series]
+
+    results = []
+    url = f"https://apex.oraclecorp.com/pls/apex/lrg_times/sucs_difs/auto_populate"
+
+    for ser in series_list:
+        # Verify series exists using ade command
+        try:
+            ser = ser.upper()
+            verify_cmd = ["ade", "showlabels", "-series", ser]
+            verify_result = subprocess.run(
+                verify_cmd, capture_output=True, text=True, timeout=30
+            )
+            # Check the last line for warnings
+            last_line = (
+                verify_result.stdout.strip().split("\n")[-1]
+                if verify_result.stdout
+                else ""
+            )
+            if "WARNING: No labels found for series" in last_line:
+                results.append({
+                    "series": ser,
+                    "status": "Error",
+                    "message": f"Series does not exist - {last_line}"
+                })
+                continue
+        except subprocess.TimeoutExpired:
+            results.append({
+                "series": ser,
+                "status": "Error",
+                "message": "ade command timed out"
+            })
+            continue
+        except subprocess.CalledProcessError as e:
+            results.append({
+                "series": ser,
+                "status": "Error",
+                "message": f"ade command failed - {e.stderr}"
+            })
+            continue
+        except Exception as e:
+            results.append({
+                "series": ser,
+                "status": "Error",
+                "message": f"Failed to verify series existence - {str(e)}"
+            })
+            continue
+
+        # POST request
+        try:
+            post_response = requests.post(
+                url, json={"series": ser, "email": email}, timeout=30
+            )
+            if post_response.status_code != 200:
+                results.append({
+                    "series": ser,
+                    "status": "Error",
+                    "message": f"POST request failed with status {post_response.status_code}: {post_response.text}"
+                })
+                continue
+        except requests.exceptions.RequestException as e:
+            results.append({
+                "series": ser,
+                "status": "Error",
+                "message": f"making POST request: {str(e)}"
+            })
+            continue
+
+        # GET request to verify
+        try:
+            get_response = requests.get(
+                url, params={"series": ser}, timeout=30
+            )
+            get_response.raise_for_status()
+            data = get_response.json()
+            items = data.get("items", [])
+            if not items:
+                results.append({
+                    "series": ser,
+                    "status": "Error",
+                    "message": "No items returned from GET request"
+                })
+                continue
+
+            first_item_series = items[0].get("series")
+            if first_item_series == ser:
+                results.append({
+                    "series": ser,
+                    "status": "Success",
+                    "message": f"Series has been added to auto-populate for email '{email}'. Verification successful."
+                })
+            else:
+                results.append({
+                    "series": ser,
+                    "status": "Error",
+                    "message": f"Verification failed. Expected series '{ser}', but got '{first_item_series}'"
+                })
+        except requests.exceptions.RequestException as e:
+            results.append({
+                "series": ser,
+                "status": "Error",
+                "message": f"making GET request: {str(e)}"
+            })
+        except ValueError as e:
+            results.append({
+                "series": ser,
+                "status": "Error",
+                "message": f"parsing GET response JSON: {str(e)}"
+            })
+        except Exception as e:
+            results.append({
+                "series": ser,
+                "status": "Error",
+                "message": f"unexpected error during verification: {str(e)}"
+            })
+
+    return {
+        "results": results,
+        "guid": guid,
+    }
+
+
+@app.tool()
+def add_label_for_se_analysis(input_id: str, guid: str) -> dict:
+    """
+    Add an ID for SE analysis with the given input ID and user GUID.
+
+    Parameters:
+    - input_id (str): The input ID (7-9 digit string like '39560536')
+    - guid (str): User GUID
+
+    Returns:
+    dict: {
+        "input_id": "39560536",
+        "label": "OSS_MAIN_LINUX.X64_250929",
+        "status": "Success",
+        "message": "Successfully added..."
+    } or {"error": "error message"}
+    """
+    try:
+        # Convert guid to email
+        email_cmd = [
+            "/home/kbaboota/scripts/label_health_copilot/utils/guid_to_email",
+            guid,
+        ]
+        email_result = subprocess.run(
+            email_cmd, capture_output=True, text=True, check=True
+        )
+        email = email_result.stdout.strip()
+        if not email:
+            return {"error": f"Could not convert guid '{guid}' to email."}
+    except subprocess.CalledProcessError as e:
+        return {"error": f"Error converting guid to email: {e.stderr}"}
+    except Exception as e:
+        return {"error": f"Error converting guid to email: {str(e)}"}
+
+    # Get label using the input_id
+    try:
+        label_cmd = [
+            "/home/kbaboota/scripts/label_health_copilot/utils/label_from_id",
+            input_id,
+        ]
+        label_result = subprocess.run(
+            label_cmd, capture_output=True, text=True, check=True
+        )
+        label = label_result.stdout.strip()
+        if not label:
+            return {"error": f"Could not get label for input ID '{input_id}'."}
+    except subprocess.CalledProcessError as e:
+        return {"error": f"Error getting label for input ID '{input_id}': {e.stderr}"}
+    except Exception as e:
+        return {"error": f"Error getting label for input ID '{input_id}': {str(e)}"}
+
+    # Make API request
+    url = "https://apex.oraclecorp.com/pls/apex/lrg_times/sucs_difs/se_auto_analysis"
+    payload = {"requested_by": email, "se_job_id": input_id, "label": label}
+
+    try:
+        response = requests.post(url, json=payload, timeout=30)
+        if response.status_code == 200:
+            return {
+                "input_id": input_id,
+                "label": label,
+                "status": "Success",
+                "message": f"Successfully added label '{label}' for SE analysis with input ID '{input_id}' for email '{email}'."
+            }
+        else:
+            return {
+                "error": f"API request failed with status {response.status_code}: {response.text}",
+                "input_id": input_id,
+                "label": label
+            }
+    except requests.exceptions.RequestException as e:
+        return {
+            "error": f"Error making API request: {str(e)}",
+            "input_id": input_id,
+            "label": label
+        }
+
+
+@app.tool()
+def add_label_for_analysis(label: str, guid: str) -> dict:
+    """
+    Add a label for analysis with the given label and user GUID.
+
+    Parameters:
+    - label (str): The label name (e.g., 'OSS_MAIN_LINUX.X64_250929')
+    - guid (str): User GUID
+
+    Returns:
+    dict: {
+        "label": "OSS_MAIN_LINUX.X64_250929",
+        "status": "Success",
+        "message": "Successfully added..."
+    } or {"error": "error message"}
+    """
+    try:
+        # Convert guid to email
+        email_cmd = [
+            "/home/kbaboota/scripts/label_health_copilot/utils/guid_to_email",
+            guid,
+        ]
+        email_result = subprocess.run(
+            email_cmd, capture_output=True, text=True, check=True
+        )
+        email = email_result.stdout.strip()
+        if not email:
+            return {"error": f"Could not convert guid '{guid}' to email."}
+    except subprocess.CalledProcessError as e:
+        return {"error": f"Error converting guid to email: {e.stderr}"}
+    except Exception as e:
+        return {"error": f"Error converting guid to email: {str(e)}"}
+
+    # Validate label exists using ade command
+    try:
+        ade_cmd = ["ade", "showlabels", "-like", label]
+        ade_result = subprocess.run(
+            ade_cmd, capture_output=True, text=True, timeout=30
+        )
+        if ade_result.returncode != 0:
+            return {"error": f"ade command failed - {ade_result.stderr}", "label": label}
+
+        # Check if the output contains the label
+        output_lines = ade_result.stdout.strip().split('\n')
+        label_found = any(label in line for line in output_lines)
+        if not label_found:
+            return {"error": "Label does not exist or is invalid.", "label": label}
+
+    except subprocess.TimeoutExpired:
+        return {"error": "ade command timed out", "label": label}
+    except Exception as e:
+        return {"error": f"Failed to validate label - {str(e)}", "label": label}
+
+    # POST request
+    try:
+        url = "https://apex.oraclecorp.com/pls/apex/lrg_times/sucs_difs/new_requests"
+        post_response = requests.post(
+            url, json={"email": email, "label": label}, timeout=30
+        )
+        if post_response.status_code == 200:
+            return {
+                "label": label,
+                "status": "Success",
+                "message": f"Label '{label}' has been added for analysis for email '{email}'."
+            }
+        else:
+            return {
+                "error": f"POST request failed with status {post_response.status_code}: {post_response.text}",
+                "label": label
+            }
+    except requests.exceptions.RequestException as e:
+        return {
+            "error": f"Error making POST request: {str(e)}",
+            "label": label
+        }
+
+
 if __name__ == "__main__":
     app.run()
-    # print(get_labels_from_series("OSS_MAIN", 5))
+    #print(get_labels_from_series("OSS_MAIN", 5))

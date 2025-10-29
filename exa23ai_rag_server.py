@@ -1,9 +1,11 @@
 # exa23ai_rag_server.py
 #!/usr/bin/env python3
 from __future__ import annotations
+from pathlib import Path
 try:
-    from dotenv import load_dotenv  
-    load_dotenv() 
+    from dotenv import load_dotenv
+    BASE_DIR = Path(__file__).resolve().parent
+    load_dotenv(BASE_DIR / ".env")
 except Exception:
     pass
 from typing import Any, Dict, Optional

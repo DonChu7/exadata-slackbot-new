@@ -56,40 +56,34 @@ def aggregate_counts(path: str, period: str = "day"):
 
 # --- feedback utils ---
 def feedback_blocks(text: str, voted: str | None, payload_json: str) -> list[dict]:
-    """
-    Build blocks for a message with optional 'You voted …' note.
-    voted: "up" | "down" | None
-    """
-    note = ""
-    if voted == "up":   note = "_You voted: :thumbsup:, thanks for your feedback!_"
-    if voted == "down": note = "_You voted: :thumbsdown:, thanks for your feedback!_"
+    """Return only the feedback controls/notes, preserving the message body separately."""
+    if voted == "up":
+        note = "_Thanks for your feedback!_"
+        return [{"type": "context", "elements": [{"type": "mrkdwn", "text": note}]}]
+    if voted == "down":
+        note = "_Thanks for your feedback!_"
+        return [{"type": "context", "elements": [{"type": "mrkdwn", "text": note}]}]
 
-    header_section = {
-        "type": "section",
-        "text": {"type": "mrkdwn", "text": "*How do you like the answer?*"}
-    }
-
-    actions = {
-        "type": "actions",
-        "elements": [
-            {
-                "type": "button", "text": {"type": "plain_text", "text": "👍"},
-                "action_id": "fb_up", "value": payload_json
-            },
-            {
-                "type": "button", "text": {"type": "plain_text", "text": "👎"},
-                "action_id": "fb_down", "value": payload_json
-            },
-        ],
-    }
-
-    out = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
-    if voted:  # show note and remove buttons once voted
-        out.append({"type": "context", "elements": [{"type": "mrkdwn", "text": note}]})
-    else:
-        out.append(header_section)
-        out.append(actions)
-    return out
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": "*How do you like the answer?*"}},
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "👍"},
+                    "action_id": "fb_up",
+                    "value": payload_json,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "👎"},
+                    "action_id": "fb_down",
+                    "value": payload_json,
+                },
+            ],
+        },
+    ]
 
 def record_feedback_click(body: dict, vote: str, client):
     # unpack payload
@@ -133,24 +127,23 @@ def record_feedback_click(body: dict, vote: str, client):
         })
 
     # --- IMPORTANT: prefer block text over fallback text
-    original_text = None
-    blocks = msg.get("blocks") or []
-    for b in blocks:
-        if b.get("type") == "section":
-            t = (b.get("text") or {}).get("text")
-            if t:
-                original_text = t
-                break
+    original_text = msg.get("text") or ""
     if not original_text:
-        # fallback if blocks missing in payload
-        original_text = msg.get("text") or " "
+        blocks = msg.get("blocks") or []
+        for b in blocks:
+            if b.get("type") == "section":
+                t = (b.get("text") or {}).get("text")
+                if t:
+                    original_text = t
+                    break
+    if not original_text:
+        original_text = " "
 
     try:
         client.chat_update(
             channel=channel_id,
             ts=ts,
-            # keep fallback short; real content is in blocks
-            text="Answer with feedback controls",
+            text=original_text,
             blocks=feedback_blocks(original_text, voted=vote, payload_json=json.dumps(payload)),
         )
     except Exception as e:

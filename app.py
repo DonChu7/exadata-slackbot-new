@@ -6,6 +6,7 @@ import json
 import time
 import base64
 import tempfile as TF
+from pathlib import Path
 import threading
 import subprocess
 import contextvars
@@ -33,7 +34,8 @@ from metrics_utils import feedback_blocks, record_feedback_click, append_jsonl, 
 
 from pydantic import BaseModel, Field
 from langchain_core.tools import tool
-from langchain_core.messages import ToolMessage, AIMessage, AnyMessage, HumanMessage
+from langchain_core.messages import ToolMessage, AIMessage, AnyMessage, HumanMessage, SystemMessage
+from langchain_core.callbacks.base import BaseCallbackHandler
 from langgraph.prebuilt import create_react_agent
 from langgraph.prebuilt.chat_agent_executor import AgentState
 
@@ -42,7 +44,64 @@ from llm_provider import make_llm
 # ---------------------------------------------------------------------------
 # Boot / env
 # ---------------------------------------------------------------------------
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+LANGGRAPH_LOG_PATH = OS.getenv("LANGGRAPH_LOG_PATH", str((BASE_DIR / "metrics/langgraph_debug.log").resolve()))
+
+class LangGraphFileLogger(BaseCallbackHandler):
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.Lock()
+        directory = OS.path.dirname(self.path)
+        if directory and not OS.path.isdir(directory):
+            OS.makedirs(directory, exist_ok=True)
+
+    def _write(self, event: str, payload: dict):
+        record = {"ts": utc_iso(), "event": event}
+        record.update(payload)
+        line = json.dumps(record, ensure_ascii=False)
+        with self._lock:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+    def _truncate(self, value, limit: int = 2000):
+        text = str(value)
+        return text if len(text) <= limit else text[:limit] + "…"
+
+    def on_chain_start(self, serialized, inputs, **kwargs):
+        name = serialized.get("name") if isinstance(serialized, dict) else str(serialized)
+        self._write("chain_start", {"name": name, "inputs": self._truncate(inputs)})
+
+    def on_chain_end(self, outputs, **kwargs):
+        self._write("chain_end", {"outputs": self._truncate(outputs)})
+
+    def on_chain_error(self, error, **kwargs):
+        self._write("chain_error", {"error": str(error)})
+
+    def on_tool_start(self, serialized, input_str, **kwargs):
+        name = serialized.get("name") if isinstance(serialized, dict) else str(serialized)
+        self._write("tool_start", {"name": name, "input": self._truncate(input_str)})
+
+    def on_tool_end(self, output, **kwargs):
+        self._write("tool_end", {"output": self._truncate(output)})
+
+    def on_tool_error(self, error, **kwargs):
+        self._write("tool_error", {"error": str(error)})
+
+    def on_llm_start(self, serialized, prompts, **kwargs):
+        name = serialized.get("name") if isinstance(serialized, dict) else str(serialized)
+        truncated_prompts = [self._truncate(p) for p in prompts] if isinstance(prompts, list) else self._truncate(prompts)
+        self._write("llm_start", {"name": name, "prompts": truncated_prompts})
+
+    def on_llm_end(self, response, **kwargs):
+        self._write("llm_end", {"response": self._truncate(response)})
+
+    def on_llm_error(self, error, **kwargs):
+        self._write("llm_error", {"error": str(error)})
+
+
+_LANGGRAPH_LOGGER = LangGraphFileLogger(LANGGRAPH_LOG_PATH)
 
 SLACK_BOT_TOKEN = OS.getenv("SLACK_BOT_TOKEN", "")
 SLACK_APP_TOKEN = OS.getenv("SLACK_APP_TOKEN", "")
@@ -73,10 +132,7 @@ DEFAULT_GENXML = OS.getenv("GENOEDAXML_PATH",
 # ---------------------------------------------------------------------------
 async def post_with_feedback(app, channel_id: str, thread_ts: str | None, text: str, *,
                        context: dict | None = None, user_id: str | None = None, client: AsyncWebClient | None = None,) -> str:
-    """
-    Posts a message with thumbs up/down buttons. Returns the message_ts.
-    'context' is saved alongside feedback (tool name, question, etc).
-    """
+    """Post the answer text and then a separate feedback-control reply."""
     # resolve user label if possible
     user_label = None
     if client and user_id:
@@ -101,8 +157,20 @@ async def post_with_feedback(app, channel_id: str, thread_ts: str | None, text: 
         channel=channel_id,
         thread_ts=thread_ts,
         text=text,
-        blocks=feedback_blocks(text, voted=None, payload_json=tiny_payload),
     )
+
+    parent_ts = thread_ts or res["ts"]
+    feedback_msg = {
+        "channel": channel_id,
+        "thread_ts": parent_ts,
+        "text": "Feedback controls",
+        "blocks": feedback_blocks(text, voted=None, payload_json=tiny_payload),
+    }
+    try:
+        await app.client.chat_postMessage(**feedback_msg)
+    except SlackApiError as e:
+        print("[Slack] failed to post feedback controls:", e)
+
     return res["ts"]
 
 # ---------------------------------------------------------------------------
@@ -331,18 +399,137 @@ def feedback_thanks_blocks(text: str, sentiment: str) -> list[dict]:
         ]},
     ]
 
+
+def _render_markdown_table(headers: list[str], rows: list[list[str]]) -> str:
+    if not headers:
+        return ""
+    widths = [len(str(h)) for h in headers]
+    normalized_rows: list[list[str]] = []
+    for row in rows:
+        normalized = []
+        for idx, header in enumerate(headers):
+            value = ""
+            if idx < len(row) and row[idx] is not None:
+                value = str(row[idx])
+            normalized.append(value)
+            if len(value) > widths[idx]:
+                widths[idx] = len(value)
+        normalized_rows.append(normalized)
+    widths = [w + 2 for w in widths]
+    header_line = "| " + " | ".join(str(headers[i]).ljust(widths[i]) for i in range(len(headers))) + " |"
+    separator_line = "| " + " | ".join("-" * widths[i] for i in range(len(headers))) + " |"
+    body_lines = [
+        "| " + " | ".join(normalized[i].ljust(widths[i]) for i in range(len(headers))) + " |"
+        for normalized in normalized_rows
+    ]
+    return "\n".join([header_line, separator_line] + body_lines)
+
+
+def _align_table_block(body: str) -> str:
+    lines = body.splitlines()
+    content = [ln for ln in lines if ln.strip()]
+    if not content or any("|" not in ln for ln in content):
+        return body
+
+    parsed_rows = []
+    separator_idx: set[int] = set()
+    max_cols = 0
+    for idx, line in enumerate(content):
+        raw = line.strip()
+        cells = raw.split("|")
+        if raw.startswith("|"):
+            cells = cells[1:]
+        if raw.endswith("|"):
+            cells = cells[:-1]
+        cells = [c.strip() for c in cells]
+        if not cells:
+            return body
+        if all(set(c) <= set("-: ") for c in cells):
+            separator_idx.add(idx)
+        parsed_rows.append(cells)
+        max_cols = max(max_cols, len(cells))
+
+    if max_cols == 0:
+        return body
+
+    widths = [0] * max_cols
+    for idx, row in enumerate(parsed_rows):
+        if idx in separator_idx:
+            continue
+        for col in range(max_cols):
+            cell = row[col] if col < len(row) else ""
+            if len(cell) > widths[col]:
+                widths[col] = len(cell)
+    widths = [w + 2 for w in widths]
+
+    aligned_lines = []
+    for idx, row in enumerate(parsed_rows):
+        if idx in separator_idx:
+            segs = ["-" * widths[col] for col in range(max_cols)]
+        else:
+            segs = [
+                (row[col] if col < len(row) else "").ljust(widths[col])
+                for col in range(max_cols)
+            ]
+        aligned_lines.append("| " + " | ".join(segs) + " |")
+
+    aligned = "\n".join(aligned_lines)
+    if body.endswith("\n"):
+        aligned += "\n"
+    return aligned
+
+
+def _align_tables_in_text(text: str) -> str:
+    code_pattern = re.compile(r"```([^\n]*)\n(.*?)```", re.DOTALL)
+
+    def repl(match: re.Match) -> str:
+        lang = match.group(1) or ""
+        body = match.group(2)
+        aligned = _align_table_block(body)
+        return f"```{lang}\n{aligned}```"
+
+    text = code_pattern.sub(repl, text)
+
+    lines = text.splitlines()
+    result: list[str] = []
+    buffer: list[str] = []
+    inside_code = False
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            if buffer:
+                result.extend(_align_table_block("\n".join(buffer)).splitlines())
+                buffer.clear()
+            inside_code = not inside_code
+            result.append(line)
+            continue
+
+        if inside_code:
+            result.append(line)
+            continue
+
+        if "|" in line:
+            buffer.append(line)
+        else:
+            if buffer:
+                result.extend(_align_table_block("\n".join(buffer)).splitlines())
+                buffer.clear()
+            result.append(line)
+
+    if buffer:
+        result.extend(_align_table_block("\n".join(buffer)).splitlines())
+
+    return "\n".join(result)
+
 def _format_lrg_table(lrgs: list[str], max_rows: int = 50) -> tuple[str, str]:
     """Build a monospace table for LRG names."""
     lrgs = [l for l in (lrgs or []) if l]
     shown = lrgs[:max_rows]
-    w = len(str(len(shown))) + 1
-    header = f"{'#':<{w}} LRG"
-    underline = "-" * len(header)
-    lines = [header, underline]
-    for i, l in enumerate(shown, 1):
-        lines.append(f"{i:<{w}} {l}")
+    rows = [[str(i), l] for i, l in enumerate(shown, 1)]
+    table = _render_markdown_table(["#", "LRG"], rows) if rows else ""
     extra = f"\n(+{len(lrgs)-max_rows} more)" if len(lrgs) > max_rows else ""
-    return "\n".join(lines), extra
+    return table, extra
 
 def _format_env_table(rows: list[dict], max_rows: int = 30) -> tuple[str, str]:
     """
@@ -352,16 +539,12 @@ def _format_env_table(rows: list[dict], max_rows: int = 30) -> tuple[str, str]:
     """
     rows = [r for r in (rows or []) if r.get("rack")]
     shown = rows[:max_rows]
-    w = len(str(len(shown))) + 1  # width for '#'
-    header = f"{'#':<{w}} RACK                         TYPE"
-    underline = "-" * len(header)
-    lines = [header, underline]
+    table_rows = []
     for i, r in enumerate(shown, 1):
-        rack = r.get("rack","")
-        typ  = r.get("type","")
-        lines.append(f"{i:<{w}} {rack:<28} {typ}")
+        table_rows.append([str(i), r.get("rack", ""), r.get("type", "")])
+    table = _render_markdown_table(["#", "RACK", "TYPE"], table_rows) if table_rows else ""
     extra = f"\n(+{len(rows)-max_rows} more)" if len(rows) > max_rows else ""
-    return "\n".join(lines), extra
+    return table, extra
 
 def _unwrap_env_list(res: Any, keys: list[str]) -> list:
     """
@@ -484,30 +667,40 @@ def _format_lrg_with_difs_table(rows: list[dict], max_rows: int = 30) -> tuple[s
     """Monospace table for lrg+counts."""
     rows = rows or []
     shown = rows[:max_rows]
-    w = len(str(len(shown))) + 1
-    header = f"{'#':<{w}} LRG                         SUCS  DIFS  NWDIF  INTDIF  SZDIF"
-    underline = "-" * len(header)
-    lines = [header, underline]
+    table_rows = []
     for i, r in enumerate(shown, 1):
-        lines.append(f"{i:<{w}} {r['lrg']:<28} {r['sucs']:>4}  {r['difs']:>4}  {r['nwdif']:>5}  {r['intdif']:>6}  {r['szdif']:>5}")
+        table_rows.append([
+            str(i),
+            str(r.get("lrg", "")),
+            str(r.get("sucs", "")),
+            str(r.get("difs", "")),
+            str(r.get("nwdif", "")),
+            str(r.get("intdif", "")),
+            str(r.get("szdif", "")),
+        ])
+    table = _render_markdown_table(["#", "LRG", "SUCS", "DIFS", "NWDIF", "INTDIF", "SZDIF"], table_rows) if table_rows else ""
     extra = f"\n(+{len(rows)-max_rows} more)" if len(rows) > max_rows else ""
-    return "\n".join(lines), extra
+    return table, extra
 
 def _format_dif_details_table(rows: list[dict], max_rows: int = 20) -> tuple[str, str]:
     """Monospace table for dif details (compact)."""
     rows = rows or []
     shown = rows[:max_rows]
-    w = len(str(len(shown))) + 1
-    header = f"{'#':<{w}} LRG                         NAME                        RTI        STATUS   ASSIGNEE"
-    underline = "-" * len(header)
-    lines = [header, underline]
     def clip(s, n): return (s[:n-1] + "…") if len(s) > n else s
+    table_rows = []
     for i, r in enumerate(shown, 1):
-        lines.append(
-            f"{i:<{w}} {clip(r['lrg'],28):<28} {clip(r['name'],26):<26} {clip(r['rti'],10):<10} {clip(r['status'],7):<7} {clip(r['assignee'],12):<12}"
-        )
+        table_rows.append([
+            str(i),
+            clip(r.get("lrg", ""), 28),
+            clip(r.get("name", ""), 26),
+            clip(r.get("rti", ""), 10),
+            clip(r.get("status", ""), 7),
+            clip(r.get("assignee", ""), 12),
+        ])
+    headers = ["#", "LRG", "NAME", "RTI", "STATUS", "ASSIGNEE"]
+    table = _render_markdown_table(headers, table_rows) if table_rows else ""
     extra = f"\n(+{len(rows)-max_rows} more)" if len(rows) > max_rows else ""
-    return "\n".join(lines), extra
+    return table, extra
 
 def _unwrap_list_generic(res: Any, keys: list[str]) -> list:
     """Return a list from a dict container (by keys) or pass through list; else []."""
@@ -562,33 +755,43 @@ def _format_dif_occ_table(rows: list[dict], max_rows: int = 25) -> tuple[str, st
     """Monospace table for dif occurrences."""
     rows = rows or []
     shown = rows[:max_rows]
-    w = len(str(len(shown))) + 1
-    header = f"{'#':<{w}} LABEL                       LRG                         DIF                         RTI        ASSIGNEE"
-    underline = "-" * len(header)
     def clip(s, n): 
         s = s or ""
         return (s[:n-1] + "…") if len(s) > n else s
-    lines = [header, underline]
+    table_rows = []
     for i, r in enumerate(shown, 1):
-        lines.append(f"{i:<{w}} {clip(r['label'],27):<27} {clip(r['lrg'],27):<27} {clip(r['name'],27):<27} {clip(r['rti'],10):<10} {clip(r['assignee'],12):<12}")
+        table_rows.append([
+            str(i),
+            clip(r.get("label", ""), 27),
+            clip(r.get("lrg", ""), 27),
+            clip(r.get("name", ""), 27),
+            clip(r.get("rti", ""), 10),
+            clip(r.get("assignee", ""), 12),
+        ])
+    headers = ["#", "LABEL", "LRG", "DIF", "RTI", "ASSIGNEE"]
+    table = _render_markdown_table(headers, table_rows) if table_rows else ""
     extra = f"\n(+{len(rows)-max_rows} more)" if len(rows) > max_rows else ""
-    return "\n".join(lines), extra
+    return table, extra
 
 def _format_widespread_table(rows: list[dict], max_rows: int = 20) -> tuple[str, str]:
     """Monospace table for widespread issues (dif name + LRG list + count)."""
     rows = rows or []
     shown = rows[:max_rows]
-    w = len(str(len(shown))) + 1
-    header = f"{'#':<{w}} DIF NAME                    COUNT  LRGs"
-    underline = "-" * len(header)
     def clip(s, n): 
         s = s or ""
         return (s[:n-1] + "…") if len(s) > n else s
-    lines = [header, underline]
+    table_rows = []
     for i, r in enumerate(shown, 1):
-        lines.append(f"{i:<{w}} {clip(r['name'],26):<26} {str(r['count']):>5}  {clip(r['lrgs'],60)}")
+        table_rows.append([
+            str(i),
+            clip(r.get("name", ""), 26),
+            str(r.get("count", "")),
+            clip(r.get("lrgs", ""), 60),
+        ])
+    headers = ["#", "DIF NAME", "COUNT", "LRGs"]
+    table = _render_markdown_table(headers, table_rows) if table_rows else ""
     extra = f"\n(+{len(rows)-max_rows} more)" if len(rows) > max_rows else ""
-    return "\n".join(lines), extra
+    return table, extra
 
 def _split_for_slack(text: str, max_chars: int = 3500) -> list[str]:
     """
@@ -689,6 +892,32 @@ def _append_history(thread_id: str, role: str, content: str | None):
     history.append({"role": role, "content": content})
     if len(history) > 20:
         del history[:-20]
+
+THREAD_REQUESTER_GUID: dict[str, str] = {}
+
+_GUID_PATTERN = re.compile(r"@([A-Za-z0-9._-]+)")
+
+
+def _remember_thread_requester(thread_id: str, user_label: str) -> None:
+    if not thread_id or not user_label:
+        return
+    match = _GUID_PATTERN.search(user_label)
+    guid = match.group(1) if match else None
+    if not guid and user_label.startswith("@"):
+        guid = user_label[1:]
+    if not guid:
+        stripped = user_label.strip()
+        if stripped and " " not in stripped and "@" not in stripped:
+            guid = stripped
+    if guid:
+        THREAD_REQUESTER_GUID[thread_id] = guid.strip()
+
+
+def _current_thread_guid() -> str | None:
+    thread_id = CURRENT_THREAD_ID.get()
+    if not thread_id:
+        return None
+    return THREAD_REQUESTER_GUID.get(thread_id)
 
 def _format_json(data: Any) -> str:
     try:
@@ -1061,6 +1290,90 @@ async def get_lrg_history_tool(lrg: str, series: str | None = None, n: int | Non
     # success: return compact JSON the agent can render (prompt tables)
     return _format_json(res)
 
+class LrgPointOfContactArgs(BaseModel):
+    lrg: str = Field(..., description="LRG identifier, e.g. 'lrgrhexaprovcluster_livemig'")
+
+
+@tool("lrg_point_of_contact", args_schema=LrgPointOfContactArgs)
+async def lrg_point_of_contact_tool(lrg: str) -> str:
+    """Return owner and backup owner details for an LRG."""
+    lrg = (lrg or "").strip()
+    if not lrg:
+        return ":x: Please provide a valid LRG name."
+
+    res = await asyncio.to_thread(
+        LABELHEALTH_CLIENT.call_tool,
+        "lrg_point_of_contact",
+        {"lrg": lrg},
+    )
+
+    thread_id = CURRENT_THREAD_ID.get()
+    if thread_id:
+        TOOL_RUN_RESULTS[thread_id].append({"name": "lrg_point_of_contact", "result": res})
+
+    if not isinstance(res, dict) or res.get("error"):
+        err = (isinstance(res, dict) and res.get("error")) or "unknown error"
+        return f":x: label health app failed to get contacts for `{lrg}`: {err}"
+
+    return _format_json(res)
+
+
+class GetIncompleteLrgsArgs(BaseModel):
+    label: str = Field(..., description="Label name, e.g. 'OSS_MAIN_LINUX.X64_250929'")
+
+
+@tool("get_incomplete_lrgs", args_schema=GetIncompleteLrgsArgs)
+async def get_incomplete_lrgs_tool(label: str) -> str:
+    """List LRGs that are still running for a label."""
+    label = (label or "").strip()
+    if not label:
+        return ":x: Please provide a label."
+
+    res = await asyncio.to_thread(
+        LABELHEALTH_CLIENT.call_tool,
+        "get_incomplete_lrgs",
+        {"label": label},
+    )
+
+    thread_id = CURRENT_THREAD_ID.get()
+    if thread_id:
+        TOOL_RUN_RESULTS[thread_id].append({"name": "get_incomplete_lrgs", "result": res})
+
+    if not isinstance(res, dict) or res.get("error"):
+        err = (isinstance(res, dict) and res.get("error")) or "unknown error"
+        return f":x: label health app failed to fetch incomplete LRGs for `{label}`: {err}"
+
+    return _format_json(res)
+
+
+class DraftEmailForLrgArgs(BaseModel):
+    label: str = Field(..., description="Label name, e.g. 'OSS_MAIN_LINUX.X64_250929'")
+    lrg: str = Field(..., description="LRG identifier")
+
+
+@tool("draft_email_for_lrg", args_schema=DraftEmailForLrgArgs)
+async def draft_email_for_lrg_tool(label: str, lrg: str) -> str:
+    """Draft an email to an LRG owner summarizing diffs in a label."""
+    args = {"label": (label or "").strip(), "lrg": (lrg or "").strip()}
+    if not args["label"] or not args["lrg"]:
+        return ":x: Both `label` and `lrg` are required to draft an email."
+
+    res = await asyncio.to_thread(
+        LABELHEALTH_CLIENT.call_tool,
+        "draft_email_for_lrg",
+        args,
+    )
+
+    thread_id = CURRENT_THREAD_ID.get()
+    if thread_id:
+        TOOL_RUN_RESULTS[thread_id].append({"name": "draft_email_for_lrg", "result": res})
+
+    if not isinstance(res, dict) or res.get("error"):
+        err = (isinstance(res, dict) and res.get("error")) or "unknown error"
+        return f":x: label health app failed to draft an email for `{args['lrg']}`: {err}"
+
+    return _format_json(res)
+
 # --- query_ai_crash_summary -------------------------------------------------
 class AiCrashSummaryArgs(BaseModel):
     label: str = Field(..., description="Label name, e.g. 'OSS_MAIN_LINUX.X64_250929'")
@@ -1226,6 +1539,119 @@ async def get_delta_diffs_between_labels_tool(label_1: str, compare_labels: str,
     return _format_json(res)
 
 
+class AddSeriesToAutoPopulateArgs(BaseModel):
+    series: str = Field(..., description="Series name (single or comma-separated list)")
+    guid: str = Field(..., description="User GUID for the requestor")
+
+
+@tool("add_series_to_auto_populate", args_schema=AddSeriesToAutoPopulateArgs)
+async def add_series_to_auto_populate_tool(series: str, guid: str) -> str:
+    """Add one or more series to the auto-populate list (mutating POST)."""
+    series_clean = (series or "").strip()
+    guid_clean = (guid or "").strip()
+    if not guid_clean:
+        fallback = _current_thread_guid()
+        if fallback:
+            guid_clean = fallback
+    if not series_clean or not guid_clean:
+        return ":x: Both `series` and `guid` are required."
+    args = {"series": series_clean, "guid": guid_clean}
+
+    res = await asyncio.to_thread(
+        LABELHEALTH_CLIENT.call_tool,
+        "add_series_to_auto_populate",
+        args,
+    )
+
+    thread_id = CURRENT_THREAD_ID.get()
+    if thread_id:
+        TOOL_RUN_RESULTS[thread_id].append({"name": "add_series_to_auto_populate", "result": res})
+
+    if not isinstance(res, dict) or res.get("error"):
+        err = (isinstance(res, dict) and res.get("error")) or "unknown error"
+        return f":x: label health app failed to add series `{args['series']}`: {err}"
+
+    return _format_json(res)
+
+
+class AddLabelForSeAnalysisArgs(BaseModel):
+    input_id: str = Field(..., description="SE job/input ID (7-9 digits)")
+    guid: str = Field(..., description="User GUID for the requestor")
+
+
+@tool("add_label_for_se_analysis", args_schema=AddLabelForSeAnalysisArgs)
+async def add_label_for_se_analysis_tool(input_id: str, guid: str) -> str:
+    """Add a label for SE analysis by job/input ID (mutating POST)."""
+    input_clean = (input_id or "").strip()
+    guid_clean = (guid or "").strip()
+    if not guid_clean:
+        fallback = _current_thread_guid()
+        if fallback:
+            guid_clean = fallback
+    if not input_clean or not guid_clean:
+        return ":x: Both `input_id` and `guid` are required."
+    args = {"input_id": input_clean, "guid": guid_clean}
+
+    res = await asyncio.to_thread(
+        LABELHEALTH_CLIENT.call_tool,
+        "add_label_for_se_analysis",
+        args,
+    )
+
+    thread_id = CURRENT_THREAD_ID.get()
+    if thread_id:
+        TOOL_RUN_RESULTS[thread_id].append({"name": "add_label_for_se_analysis", "result": res})
+
+    if not isinstance(res, dict) or res.get("error"):
+        err = (isinstance(res, dict) and res.get("error")) or "unknown error"
+        return f":x: label health app failed to add SE analysis input `{args['input_id']}`: {err}"
+
+    view_id = res.get("input_id") or input_clean
+    note = ""
+    if view_id:
+        note = (
+            "\n\nTo view the analysis on the portal when it's complete, visit "
+            f"https://apex.oraclecorp.com/pls/apex/r/lrg_times/oss-label-health/se-label-analysis1?p34_id={view_id}"
+        )
+
+    return _format_json(res) + note
+
+
+class AddLabelForAnalysisArgs(BaseModel):
+    label: str = Field(..., description="Label name, e.g. 'OSS_MAIN_LINUX.X64_250929'")
+    guid: str = Field(..., description="User GUID for the requestor")
+
+
+@tool("add_label_for_analysis", args_schema=AddLabelForAnalysisArgs)
+async def add_label_for_analysis_tool(label: str, guid: str) -> str:
+    """Add a label to the analysis queue (mutating POST)."""
+    label_clean = (label or "").strip()
+    guid_clean = (guid or "").strip()
+    if not guid_clean:
+        fallback = _current_thread_guid()
+        if fallback:
+            guid_clean = fallback
+    if not label_clean or not guid_clean:
+        return ":x: Both `label` and `guid` are required."
+    args = {"label": label_clean, "guid": guid_clean}
+
+    res = await asyncio.to_thread(
+        LABELHEALTH_CLIENT.call_tool,
+        "add_label_for_analysis",
+        args,
+    )
+
+    thread_id = CURRENT_THREAD_ID.get()
+    if thread_id:
+        TOOL_RUN_RESULTS[thread_id].append({"name": "add_label_for_analysis", "result": res})
+
+    if not isinstance(res, dict) or res.get("error"):
+        err = (isinstance(res, dict) and res.get("error")) or "unknown error"
+        return f":x: label health app failed to add label `{args['label']}`: {err}"
+
+    return _format_json(res)
+
+
 
 class RagQueryArgs(BaseModel):
     question: str = Field(..., description="Question to answer using the Exadata knowledge base.")
@@ -1236,6 +1662,19 @@ class RagQueryArgs(BaseModel):
 async def rag_query_tool(question: str, k: int = 3) -> str:
     "Retrieve grounded answers about Exadata and Oracle topics."
     res = await asyncio.to_thread(RAG_CLIENT.call_tool, "rag_query", {"question": question, "k": k})
+
+    if isinstance(res, dict):
+        answer = res.get("answer") or res.get("result") or ""
+        sources = []
+        for src in res.get("sources") or []:
+            sources.append({
+                "title": (src.get("title") or "").strip() or "untitled",
+                "resource": src.get("source"),
+                "score": src.get("score"),
+                "chunk_preview": src.get("chunk_preview"),
+            })
+        res = {"answer": answer, "sources": sources}
+
     return _format_json(res)
 
 
@@ -1264,7 +1703,7 @@ Use the following tools when applicable:
 - runintegration_idle_envs: list idle RunIntegration environments that are ready to use.
 - runintegration_disabled_envs: list disabled RunIntegration environments.
 - summarize_text: summarize provided text when the user explicitly asks for a summary without a PDF attachment.
-- rag_query: answer general Exadata or Oracle questions with sourced references. When you use this tool, include the cited titles in your reply. For general informational queries (“how to…”, “what is…”, “explain…”, guides, steps) about Exadata/Exascale, ALWAYS call the rag_query tool first to retrieve grounded sources before answering. Do not answer from memory.
+- rag_query: answer general Exadata or Oracle questions with sourced references. When you use this tool, include the cited titles *and resource locations* in your reply. For general informational queries (“how to…”, “what is…”, “explain…”, guides, steps) about Exadata/Exascale, ALWAYS call the rag_query tool first to retrieve grounded sources before answering. Do not answer from memory.
 - get_labels_from_series: Get n recent labels from the given series. The series can be "OSS_MAIN", "OSS_25.2" etc..
 - get_lrgs_from_regress: list all LRGs associated with a regress (e.g., 'SAGE_FC').
 - find_lrg_with_difs: list LRGs with dif counts for a label (optionally filtered).
@@ -1273,6 +1712,9 @@ Use the following tools when applicable:
 - find_widespread_issues: list widespread difs for a label (dif name, affected LRGs, count).
 - find_crashes: list crash entries for a given label (LRG, name, status, RTI number, assignee, comments).
 - get_lrg_history: list history entries for an LRG (optionally filter by series and number of labels).
+- lrg_point_of_contact: return the owner and backup owner for an LRG.
+- get_incomplete_lrgs: list LRGs that are still running for a label.
+- draft_email_for_lrg: draft an email to an LRG owner summarizing diffs for a label (use only when the user asks for an email template).
 - query_ai_crash_summary: AI-generated crash summary for a specific crash (label + LRG + dif).
 - get_se_rerun_details: SE rerun details for a label (optionally filter by SE job id).
 - get_regress_summary: weekly regress summary for a regress in a series.
@@ -1280,6 +1722,9 @@ Use the following tools when applicable:
 - get_ai_label_summary: fetch an existing AI-generated summary for a label.
 - generate_ai_label_summary: generate an AI summary for a label (may take time).
 - get_delta_diffs_between_labels: delta diffs for label_1 vs. compare_labels (show_common = 'Y' or 'N').
+- add_series_to_auto_populate: add one or more series to the auto-populate list (POST; defaults to the requester's Slack handle when `guid` is omitted).
+- add_label_for_se_analysis: add an SE job/input ID for analysis (POST; defaults to the requester's Slack handle when `guid` is omitted).
+- add_label_for_analysis: add a label to the analysis queue (POST; defaults to the requester's Slack handle when `guid` is omitted).
 
 TABLE FORMATTING GUIDELINES (TOOL-SPECIFIC)
 
@@ -1303,7 +1748,9 @@ Label Health – Crashes:
 
 Also print out the actual error message if you encounter.
 """
-    return [{"role": "system", "content": prompt}] + state["messages"]
+    system_message = SystemMessage(content=prompt)
+    existing_messages: List[AnyMessage] = list(state["messages"])
+    return [system_message, *existing_messages]
 
 
 LLM = make_llm()
@@ -1323,6 +1770,9 @@ AGENT_TOOLS = [
     find_widespread_issues_tool,
     find_crashes_tool,
     get_lrg_history_tool,  
+    lrg_point_of_contact_tool,
+    get_incomplete_lrgs_tool,
+    draft_email_for_lrg_tool,
     query_ai_crash_summary_tool,
     get_se_rerun_details_tool,
     get_regress_summary_tool, 
@@ -1330,11 +1780,15 @@ AGENT_TOOLS = [
     get_ai_label_summary_tool,
     generate_ai_label_summary_tool,
     get_delta_diffs_between_labels_tool,
+    add_series_to_auto_populate_tool,
+    add_label_for_se_analysis_tool,
+    add_label_for_analysis_tool,
 ]
 AGENT = create_react_agent(
     model=LLM,
     tools=AGENT_TOOLS,
     prompt=slack_recurring_prompt,
+    debug=True,
 )
 
 
@@ -1579,9 +2033,11 @@ async def handle_app_mention(event, say, client):
     # Immediate feedback message
     user_id = event.get("user")  # Slack user ID 
     first_name = await _get_first_name(client, user_id)
+    user_label = await _get_user_label(client, user_id)
+    _remember_thread_requester(thread_key, user_label)
     await say(f"Hi {first_name}, I received your request.\nPlease wait while I generate a response… :hourglass_flowing_sand:",
           thread_ts=thread_ts)
- 
+
 
     if "summarize" in lower:
         try:
@@ -1751,7 +2207,7 @@ async def handle_app_mention(event, say, client):
             await say(f"⚠️ Error sending file: {e}", thread_ts=thread_ts)
         return
 
-    config = {"configurable": {"thread_id": thread_key}}
+    config = {"configurable": {"thread_id": thread_key}, "callbacks": [_LANGGRAPH_LOGGER]}
     prior_messages = list(THREAD_HISTORY[thread_key])
     agent_messages = prior_messages + [{"role": "user", "content": cleaned}]
     token = CURRENT_THREAD_ID.set(thread_key)
@@ -1772,7 +2228,8 @@ async def handle_app_mention(event, say, client):
                 ans = fallback.get("answer", "[no answer]")
                 srcs = fallback.get("sources", []) or []
                 src_lines = "\n".join(
-                    f"• {s.get('title', 'untitled')} ({s.get('source') or 'n/a'})" for s in srcs
+                    f"• {s.get('title', 'untitled')} ({s.get('resource') or s.get('source') or 'n/a'})"
+                    for s in srcs
                 )
                 fallback_text = f"{ans}\n\n*Sources:*\n{src_lines or '—'}"
                 await say(fallback_text, thread_ts=thread_ts)
@@ -1794,6 +2251,7 @@ async def handle_app_mention(event, say, client):
     if final_message is None and messages:
         final_message = messages[-1]
     final_text = _extract_message_text(final_message) if final_message else ""
+    final_text = _align_tables_in_text(final_text)
     tool_names = _collect_tool_names(messages)
 
     _append_history(thread_key, "user", cleaned)
@@ -2023,7 +2481,9 @@ async def handle_app_mention(event, say, client):
             suffix = f" (Part {i}/{total})" if total > 1 else ""
             text_out = (chunk + suffix).rstrip()
             if i == 1:
-                text_out = text_out if text_out.endswith("```") else (text_out + "\n```")
+                fence_count = text_out.count("```")
+                if fence_count % 2 == 1 and not text_out.endswith("```"):
+                    text_out += "\n```"
             try:
                 if i == total:
                     # ✅ Only the LAST chunk gets the feedback buttons

@@ -29,11 +29,11 @@ def _is_allowed_path(path: str) -> bool:
 
 # ---------- tools (manual engine) ----------
 @app.tool()
-def health() -> Dict[str, Any]:
+def health() -> dict:
     return sa.health()
 
 @app.tool()
-def summarize_text(text: str, style_hint: Optional[str] = None) -> Dict[str, Any]:
+def summarize_text(text: str, style_hint: Optional[str] = None) -> dict:
     """Summarize plain text (manual engine)."""
     return sa.summarize_text(text, style_hint=style_hint)
 
